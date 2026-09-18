@@ -18,7 +18,8 @@ radio.
 This is the way out. A Linux box holds a permanent BLE connection to the high
 node and lends it a network stack, without changing who the gateway *is*.
 
-![Web client connected through the BLE bridge](docs/img/web-client-connected.png)
+![A Meshtastic web client driving the node over the BLE bridge: live packet capture,
+heard-via topology and per-node signal history](docs/img/web-client-connected.png)
 
 ## What you get
 
