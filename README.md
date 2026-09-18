@@ -215,4 +215,5 @@ project and is not affiliated with or endorsed by Meshtastic LLC.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[GLWTPL](LICENSE) — the Good Luck With That Public License. Which, given the note
+at the top of this file, is the only honest choice.
