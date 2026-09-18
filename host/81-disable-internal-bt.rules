@@ -1,0 +1,4 @@
+# Disable the internal Realtek RTL8852 BT radio (0bda:b85b) on mesh-gw.
+# It cannot hear the solar node; with it gone, the RTL8761BU USB dongle is the
+# only adapter, so ble-bridge's adapter auto-detect always lands on the dongle.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="b85b", ATTR{authorized}="0"

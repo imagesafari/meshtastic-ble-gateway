@@ -1,0 +1,24 @@
+[Unit]
+Description=Meshtastic HTTP-API shim — web-client HTTP API to TCP 4403
+Wants=ble-bridge.service
+After=ble-bridge.service
+
+[Container]
+Image=docker.io/library/python:3.12-alpine
+ContainerName=mesh-api
+Network=host
+Volume=/etc/mesh-gateway/http_api_shim.py:/app/http_api_shim.py:ro
+Environment=NODE_HOST=127.0.0.1
+Environment=NODE_PORT=4403
+Environment=PORT=4405
+# Origins allowed to call the API from a browser. TLS is terminated upstream
+# by Nginx Proxy Manager on docker-nginx (wildcard *.example.com LE cert).
+Environment=ALLOW_ORIGINS=https://your-client.example.com
+Exec=python /app/http_api_shim.py
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

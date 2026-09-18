@@ -1,0 +1,21 @@
+[Unit]
+Description=Meshtastic BLE bridge — solar node (AA:BB:CC:DD:EE:FF) to TCP 4403
+Wants=bluetooth.service network-online.target
+After=bluetooth.service network-online.target
+
+[Container]
+Image=ghcr.io/yeraze/meshtastic-ble-bridge:latest
+ContainerName=ble-bridge
+Network=host
+PodmanArgs=--privileged
+Volume=/var/run/dbus:/var/run/dbus
+Volume=/var/lib/bluetooth:/var/lib/bluetooth:ro
+Volume=/etc/avahi/services:/etc/avahi/services
+Exec=AA:BB:CC:DD:EE:FF
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

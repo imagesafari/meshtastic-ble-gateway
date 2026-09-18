@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+# One-time BLE pairing of the solar node from the gateway host.
+# Run on the host (needs bluez + expect): expect pair-node.exp
+# The node must be advertising — nothing else may hold its single BLE slot
+# (close the phone app, stop ble-bridge.service first).
+set timeout 60
+set mac "AA:BB:CC:DD:EE:FF"
+set pin "123456"
+spawn bluetoothctl
+expect "#"
+send "agent KeyboardOnly\r"
+expect "Agent registered"
+send "default-agent\r"
+expect "Default agent request successful"
+send "scan on\r"
+expect {
+  -re "yournode_eeff|$mac" { send "scan off\r" }
+  timeout { puts "SCAN-TIMEOUT"; exit 2 }
+}
+sleep 1
+send "pair $mac\r"
+expect {
+  -re "Enter passkey.*:" { send "$pin\r" }
+  "Pairing successful" { }
+  timeout { puts "PAIR-TIMEOUT"; exit 3 }
+}
+expect {
+  "Pairing successful" { }
+  "Failed to pair" { puts "PAIR-FAILED"; exit 4 }
+  timeout { puts "PAIR-TIMEOUT2"; exit 5 }
+}
+send "trust $mac\r"
+expect "trust succeeded"
+send "disconnect $mac\r"
+expect {
+  "Successful disconnected" { }
+  "not available" { }
+  timeout { }
+}
+send "quit\r"
+puts "PAIR-OK"

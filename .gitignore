@@ -1,0 +1,8 @@
+# Secrets and host-specific config
+.env
+*.env
+!.env.example
+!config/meshmonitor.env.example
+
+__pycache__/
+*.pyc

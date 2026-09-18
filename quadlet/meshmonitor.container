@@ -1,0 +1,25 @@
+[Unit]
+Description=MeshMonitor web UI — full Meshtastic client over the BLE bridge
+Wants=ble-bridge.service
+After=ble-bridge.service
+
+[Container]
+Image=ghcr.io/yeraze/meshmonitor:latest
+ContainerName=meshmonitor
+Network=host
+# SESSION_SECRET, ALLOWED_ORIGINS etc. live on the host, not in the repo.
+# See config/meshmonitor.env.example; deploy.sh refuses to run without the real file.
+EnvironmentFile=/etc/mesh-gateway/meshmonitor.env
+Environment=MESHTASTIC_NODE_IP=127.0.0.1
+Environment=MESHTASTIC_TCP_PORT=4403
+Environment=PORT=3001
+Environment=TRUST_PROXY=true
+Environment=COOKIE_SECURE=true
+Volume=meshmonitor-data:/data
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

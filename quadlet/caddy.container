@@ -1,0 +1,19 @@
+[Unit]
+Description=Caddy — HTTPS (internal CA) in front of MeshMonitor
+Wants=meshmonitor.service
+After=meshmonitor.service
+
+[Container]
+Image=docker.io/library/caddy:latest
+ContainerName=caddy
+Network=host
+Volume=/etc/mesh-gateway/Caddyfile:/etc/caddy/Caddyfile:ro
+Volume=caddy-data:/data
+Volume=caddy-config:/config
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

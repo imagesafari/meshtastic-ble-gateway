@@ -1,0 +1,111 @@
+# Docker Compose deployment. The quadlet/ units are the same five containers for
+# podman + systemd; this file is the Docker equivalent and is the easier start.
+#
+# REQUIRES LINUX. Every service uses host networking, and the bridge needs the
+# host's Bluetooth stack over D-Bus. Docker Desktop on macOS and Windows runs
+# containers inside a VM with no access to your Bluetooth adapter, so this
+# cannot work there — use a Linux box within radio range of the node.
+#
+#   cp .env.example .env     # set NODE_BLE_MAC at minimum
+#   docker compose up -d
+#
+# Host networking means these bind ports directly on the host:
+#   4403  Meshtastic TCP (from the bridge)      4405  HTTP API shim
+#   3001  MeshMonitor                            443  Caddy (HTTPS, internal CA)
+
+services:
+  # ── The one that touches hardware ───────────────────────────────────────────
+  ble-bridge:
+    image: ghcr.io/yeraze/meshtastic-ble-bridge:latest
+    container_name: ble-bridge
+    restart: unless-stopped
+    network_mode: host
+    # Privileged because it drives the host's Bluetooth adapter. Narrower
+    # capabilities (NET_ADMIN + NET_RAW) are worth trying on your setup, but
+    # BlueZ over D-Bus is fussy and privileged is what is known to work here.
+    privileged: true
+    volumes:
+      - /var/run/dbus:/var/run/dbus          # BlueZ lives on the system bus
+      - /var/lib/bluetooth:/var/lib/bluetooth:ro   # the pairing you did once
+      - /etc/avahi/services:/etc/avahi/services     # optional: mDNS for phone apps
+    # The node's BLE MAC. Pair it first — see host/pair-node.exp.
+    command: ["${NODE_BLE_MAC:?set NODE_BLE_MAC in .env}"]
+
+  # ── Publishes the node's own MQTT messages, unmodified ──────────────────────
+  mqtt-proxy:
+    image: ghcr.io/ln4cy/mqtt-proxy:latest
+    container_name: mqtt-proxy
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [ble-bridge]
+    environment:
+      INTERFACE_TYPE: tcp
+      TCP_NODE_HOST: 127.0.0.1
+      TCP_NODE_PORT: "4403"
+      # Loads sitecustomize.py at interpreter startup. That patch raises a
+      # hardcoded 30s config-download deadline in the meshtastic library which a
+      # BLE-bridged dump cannot reliably meet. Without it the proxy reconnects
+      # forever and never uplinks anything. See config/mqtt-proxy-patch/.
+      PYTHONPATH: /patch
+    volumes:
+      - ./config/mqtt-proxy-patch:/patch:ro
+    # Broker address, credentials and which channels uplink are read FROM THE
+    # NODE, not from here. Configure them on the radio; see the README.
+
+  # ── Lets a browser client reach a node that only speaks TCP ─────────────────
+  mesh-api:
+    image: python:3.12-alpine
+    container_name: mesh-api
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [ble-bridge]
+    environment:
+      NODE_HOST: 127.0.0.1
+      NODE_PORT: "4403"
+      PORT: "4405"
+      # Browsers enforce this. Set it to the exact origin your web client is
+      # served from; "*" works but means any page can drive your radio.
+      ALLOW_ORIGINS: "${ALLOW_ORIGINS:-*}"
+    volumes:
+      - ./shim/http_api_shim.py:/app/http_api_shim.py:ro
+    command: ["python", "/app/http_api_shim.py"]
+
+  # ── Optional web UI ─────────────────────────────────────────────────────────
+  # NOTE: this is a THIRD client on the bridge. Read the "How many clients" section
+  # of the README before enabling it — two TCP clients work, three livelock and
+  # silently stop all MQTT uplink. Start with this commented out.
+  meshmonitor:
+    image: ghcr.io/yeraze/meshmonitor:latest
+    container_name: meshmonitor
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [ble-bridge]
+    profiles: ["with-meshmonitor"]   # docker compose --profile with-meshmonitor up -d
+    environment:
+      MESHTASTIC_NODE_IP: 127.0.0.1
+      MESHTASTIC_TCP_PORT: "4403"
+      PORT: "3001"
+      TRUST_PROXY: "true"
+      COOKIE_SECURE: "true"
+      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env}"
+      ALLOWED_ORIGINS: "${MESHMONITOR_ORIGINS:-}"
+    volumes:
+      - meshmonitor-data:/data
+
+  # ── Optional HTTPS on a bare IP, via an internal CA ─────────────────────────
+  # Only useful if you are not already terminating TLS somewhere upstream.
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    network_mode: host
+    profiles: ["with-caddy"]
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  meshmonitor-data:
+  caddy-data:
+  caddy-config:

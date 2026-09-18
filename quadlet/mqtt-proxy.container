@@ -1,0 +1,27 @@
+[Unit]
+Description=Meshtastic MQTT client proxy — uplinks the node's own MQTT config via TCP 4403
+Wants=ble-bridge.service
+After=ble-bridge.service
+
+[Container]
+Image=ghcr.io/ln4cy/mqtt-proxy:latest
+ContainerName=mqtt-proxy
+Network=host
+Environment=INTERFACE_TYPE=tcp
+Environment=TCP_NODE_HOST=127.0.0.1
+Environment=TCP_NODE_PORT=4403
+# The meshtastic lib waits a hardcoded 30s for the config download to finish
+# (stream_interface.connect() calls _waitConnected() with no argument). A clean
+# dump through the bridge measures ~29s, so any contention wedges the proxy in a
+# reconnect loop forever. No env knob exists — TCP_TIMEOUT is the socket timeout
+# and CONFIG_WAIT_TIMEOUT only gates a log line — so a mounted sitecustomize.py
+# raises the default at interpreter startup. See config/mqtt-proxy-patch/.
+Volume=/etc/mesh-gateway/mqtt-proxy-patch:/patch:ro
+Environment=PYTHONPATH=/patch
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
