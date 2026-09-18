@@ -215,4 +215,4 @@ project and is not affiliated with or endorsed by Meshtastic LLC.
 
 ## License
 
-[GLWTPL](LICENSE) — the Good Luck With That Public License.
+[GLWTPL](LICENSE) — the [Good Luck With That Public License](https://github.com/me-shaon/GLWTPL).
