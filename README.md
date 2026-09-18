@@ -1,5 +1,8 @@
 # meshtastic-ble-gateway
 
+> **Note:** this is 100% vibecoded. It works great for me, but your mileage may
+> vary. Proceed accordingly.
+
 **Turn a Meshtastic node with no network hardware into a full MQTT gateway and a
 browser-reachable radio — over Bluetooth.**
 
