@@ -72,7 +72,7 @@ receive dominates at 5–12 mA; BLE adds 0.02–0.5 mA. A solar node does not no
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/meshtastic-ble-gateway
+git clone https://github.com/imagesafari/meshtastic-ble-gateway
 cd meshtastic-ble-gateway
 
 # 1. Pair the node, once. Nothing else may hold its single BLE slot -
