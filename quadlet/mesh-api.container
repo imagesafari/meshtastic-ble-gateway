@@ -1,7 +1,12 @@
 [Unit]
 Description=Meshtastic HTTP-API shim — web-client HTTP API to TCP 4403
 Wants=ble-bridge.service
-After=ble-bridge.service
+# mqtt-proxy must complete its config dump with no other TCP client on 4403.
+# The bridge broadcasts the node stream to every client, so this shim's
+# configComplete can otherwise land mid-dump and leave the proxy with an empty
+# channel table - which makes it drop every outbound packet, silently, forever.
+# See host/mesh-uplink-watchdog.sh.
+After=ble-bridge.service mqtt-proxy.service
 
 [Container]
 Image=docker.io/library/python:3.12-alpine
@@ -11,12 +16,17 @@ Volume=/etc/mesh-gateway/http_api_shim.py:/app/http_api_shim.py:ro
 Environment=NODE_HOST=127.0.0.1
 Environment=NODE_PORT=4403
 Environment=PORT=4405
-# Origins allowed to call the API from a browser. TLS is terminated upstream
-# by Nginx Proxy Manager on docker-nginx (wildcard *.example.com LE cert).
+# Origins allowed to call the API from a browser. Set this to the exact origin
+# your web client is served from. If you terminate TLS upstream (a reverse
+# proxy with a wildcard cert, say), that proxy's hostname is the origin here.
 Environment=ALLOW_ORIGINS=https://your-client.example.com
 Exec=python /app/http_api_shim.py
 
 [Service]
+# After= only orders the *start*; a quadlet unit is active as soon as the
+# container launches, while mqtt-proxy still needs ~40s to pull the node config.
+# This gate is what actually keeps this shim off the bridge during that window.
+ExecStartPre=/usr/local/bin/wait-for-mqtt-proxy-config.sh
 Restart=always
 RestartSec=5
 

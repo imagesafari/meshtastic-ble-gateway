@@ -1,0 +1,8 @@
+[Unit]
+Description=Repair an mqtt-proxy that is up but uplinking nothing
+After=mqtt-proxy.service
+Documentation=https://github.com/imagesafari/meshtastic-ble-gateway
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mesh-uplink-watchdog.sh

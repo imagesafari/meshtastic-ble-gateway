@@ -1,0 +1,12 @@
+[Unit]
+Description=Check every 10 minutes that the mesh uplink is actually passing traffic
+
+[Timer]
+# First check 5 min after boot, so the stack has settled and mqtt-proxy has had
+# time for its config dump (~40s here, and it grows with the size of your mesh).
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

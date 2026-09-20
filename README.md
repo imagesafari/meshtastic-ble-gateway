@@ -126,9 +126,12 @@ attached.
 **Two TCP clients work. Three livelock.**
 
 When a client attaches it requests a full config dump. Through a BLE bridge that
-dump takes roughly **29 seconds**, against a 30-second deadline hardcoded in the
-meshtastic Python library. That leaves about a second of headroom, and *any*
-second client requesting config restarts the dump for everyone.
+dump takes roughly **30-40 seconds**, against a 30-second deadline hardcoded in
+the meshtastic Python library — and it grows with the size of your mesh. It
+measured 28.8s on a mesh of 178 known nodes and 38.8s a month later on the same
+hardware, so the stock deadline is now missed outright: even the bundled
+`meshtastic` CLI times out. `config/mqtt-proxy-patch/` exists for this. Any
+second client requesting config also restarts the dump for everyone.
 
 With three, nobody ever finishes. Every client ends up with an empty channel
 table, and `mqtt-proxy` then rejects every message as
@@ -152,6 +155,52 @@ Budget two TCP clients:
 Browser clients are free because `mesh-api` holds one connection and fans frames
 out to a queue per client. Ten tabs cost one slot. Anything speaking raw TCP
 costs its own. This is why MeshMonitor is behind a profile and off by default.
+
+## Two clients are not automatically safe — ordering matters
+
+The three-client livelock above is the loud version. There is a quieter one that
+bites at **two** clients, and it is the same empty channel table by a different
+route.
+
+The bridge broadcasts the node's stream to *every* attached TCP client. So if
+`mesh-api` attaches while `mqtt-proxy`'s dump is still in flight, the proxy can
+see the shim's `configComplete`, conclude its own dump is finished, and carry on
+with a channel table that is missing everything that went past during the
+restart. It then drops every outbound packet "to prevent loops" — the correct
+default for a genuinely unknown channel, and fatal when the channel is unknown
+only because the config never arrived.
+
+That ran for **79 hours** here before anyone noticed. Five services up, BLE
+connected, radio packets arriving every few seconds, broker connected,
+`MQTT Connected: True` in every status block, and `scripts/verify.sh` passing
+throughout.
+
+Two log lines actively mislead while it is happening:
+
+- `uplink_enabled=False for channel 'LongFast'` reads as *the node has uplink
+  disabled*. It does not. It means "no channel by that name, so I assumed
+  false". Check the node itself — `meshtastic --info` will show
+  `uplink_enabled: True`. Do not go changing the channel to match: `mqtt-proxy`
+  already resolves an unnamed primary channel to `LongFast`, so a blank name is
+  not your problem.
+- `MQTT Activity: Ns ago` counts **inbound** broker traffic. It keeps ticking
+  over happily while nothing whatsoever is being published.
+
+Three guards ship for this:
+
+| Guard | What it does |
+|---|---|
+| `host/wait-for-mqtt-proxy-config.sh` | `ExecStartPre` on `mesh-api`. `After=` alone is not enough — a quadlet unit is active the moment its container launches, while the proxy still needs ~40s. This is what keeps the shim off the bridge during the dump. Never fails closed: a dead proxy must not also cost you the UI. |
+| `host/mesh-uplink-watchdog.{sh,service,timer}` | Checks every 10 min. Keys on `Dropping Node->MQTT`, which means a packet arrived and was thrown away — so it cannot false-positive on a quiet mesh. Repairs by the ordered restart, and pings healthchecks.io. Works under Compose too: `RESTART_MODE=compose CTR=docker COMPOSE_DIR=$PWD`. |
+| `scripts/verify.sh` | Asserts no drops in the last 15 min, rather than only that the broker is reachable. |
+
+Set `HC_PING_URL` in `/etc/mesh-gateway/watchdog.env` (chmod 600), or the
+watchdog repairs quietly and nothing tells you it happened.
+
+**Manual recovery**, if you need it: stop `mesh-api` *and* `mqtt-proxy`, start
+`mqtt-proxy` alone, wait for `Node config fully loaded` followed by a
+`Node->MQTT: Topic=` line with no drop after it, then start `mesh-api`. The
+proxy must take its config dump with nothing else attached to 4403.
 
 ## Why the shim exists
 
@@ -184,6 +233,7 @@ queues described above. 215 lines, standard library only, so it runs in a bare
 | `shim/http_api_shim.py` | **this repo** — the HTTP API translator |
 | `config/mqtt-proxy-patch/` | **this repo** — timeout patch, mounted into the stock image (no fork) |
 | `quadlet/`, `scripts/` | **this repo** — podman/systemd units and deploy helpers |
+| `host/mesh-uplink-watchdog.sh` | **this repo** — detects and repairs a silently dead uplink |
 
 ## Things that cost us a day each
 

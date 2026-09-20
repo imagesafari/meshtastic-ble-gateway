@@ -58,7 +58,21 @@ services:
     container_name: mesh-api
     restart: unless-stopped
     network_mode: host
-    depends_on: [ble-bridge]
+    # ORDER MATTERS, and depends_on cannot express it. mqtt-proxy needs ~40s
+    # after starting to pull the node config over the bridge, and the bridge
+    # broadcasts the node stream to EVERY client - so if this shim attaches
+    # during that window, the proxy can adopt the shim's configComplete, finish
+    # with an empty channel table, and silently drop all MQTT uplink from then
+    # on. depends_on only waits for the container to START, not for that dump.
+    #
+    # Bring it up in two steps the first time, and after any proxy restart:
+    #   docker compose up -d ble-bridge mqtt-proxy
+    #   docker compose logs -f mqtt-proxy    # wait for "Node config fully loaded"
+    #   docker compose up -d
+    #
+    # host/mesh-uplink-watchdog.sh catches it if you forget:
+    #   RESTART_MODE=compose CTR=docker COMPOSE_DIR=$PWD host/mesh-uplink-watchdog.sh
+    depends_on: [ble-bridge, mqtt-proxy]
     environment:
       NODE_HOST: 127.0.0.1
       NODE_PORT: "4403"
