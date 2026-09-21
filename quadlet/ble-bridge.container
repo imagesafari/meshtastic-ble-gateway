@@ -11,6 +11,14 @@ PodmanArgs=--privileged
 Volume=/var/run/dbus:/var/run/dbus
 Volume=/var/lib/bluetooth:/var/lib/bluetooth:ro
 Volume=/etc/avahi/services:/etc/avahi/services
+# The bridge stops trying to reach the node in two places - a class constant
+# (MAX_RECONNECT_ATTEMPTS = 10) and a local in the poll loop (max_wait = 600) -
+# and after either one it KEEPS RUNNING with no radio. Restart=always cannot
+# help because nothing exits. This wrapper watches the bridge's own log output,
+# the only stable interface to both, and exits non-zero when it gives up so
+# systemd recreates the container. See host/ble-bridge-entrypoint.sh.
+Volume=/etc/mesh-gateway/ble-bridge-entrypoint.sh:/entrypoint.sh:ro
+Entrypoint=/entrypoint.sh
 Exec=AA:BB:CC:DD:EE:FF
 
 [Service]

@@ -24,6 +24,10 @@ scp -o BatchMode=yes -q "$REPO_DIR"/config/mqtt-proxy-patch/sitecustomize.py "$T
 scp -o BatchMode=yes -q "$REPO_DIR"/host/81-disable-internal-bt.rules "$TARGET":/etc/udev/rules.d/
 # Uplink watchdog + the readiness gate mesh-api.container calls as ExecStartPre.
 # The stack can be fully "up" and passing no traffic at all; see the watchdog.
+# The bridge keeps running with no radio after it gives up reconnecting; this
+# wrapper is its entrypoint and exits so systemd can recreate the container.
+scp -o BatchMode=yes -q "$REPO_DIR"/host/ble-bridge-entrypoint.sh "$TARGET":/etc/mesh-gateway/ble-bridge-entrypoint.sh
+ssh -o BatchMode=yes "$TARGET" chmod +x /etc/mesh-gateway/ble-bridge-entrypoint.sh
 scp -o BatchMode=yes -q "$REPO_DIR"/host/mesh-uplink-watchdog.sh "$TARGET":/usr/local/bin/mesh-uplink-watchdog.sh
 scp -o BatchMode=yes -q "$REPO_DIR"/host/wait-for-mqtt-proxy-config.sh "$TARGET":/usr/local/bin/wait-for-mqtt-proxy-config.sh
 ssh -o BatchMode=yes "$TARGET" chmod +x /usr/local/bin/mesh-uplink-watchdog.sh /usr/local/bin/wait-for-mqtt-proxy-config.sh

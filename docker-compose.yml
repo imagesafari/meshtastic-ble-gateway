@@ -28,6 +28,13 @@ services:
       - /var/run/dbus:/var/run/dbus          # BlueZ lives on the system bus
       - /var/lib/bluetooth:/var/lib/bluetooth:ro   # the pairing you did once
       - /etc/avahi/services:/etc/avahi/services     # optional: mDNS for phone apps
+      - ./host/ble-bridge-entrypoint.sh:/entrypoint.sh:ro
+    # The bridge gives up reconnecting after ~10 minutes and then KEEPS RUNNING
+    # with no radio — container up, port open, nothing behind it. restart:
+    # unless-stopped cannot help, because nothing exits. This wrapper watches
+    # the bridge's own log and exits when it gives up, so the container is
+    # recreated. See host/ble-bridge-entrypoint.sh.
+    entrypoint: ["/entrypoint.sh"]
     # The node's BLE MAC. Pair it first — see host/pair-node.exp.
     command: ["${NODE_BLE_MAC:?set NODE_BLE_MAC in .env}"]
 
