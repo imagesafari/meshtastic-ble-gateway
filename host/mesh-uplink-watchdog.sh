@@ -97,8 +97,16 @@ bridge_gave_up() {
 
 ble_down()     { "$CTR" logs --since "$WINDOW" ble-bridge 2>&1 | grep -q 'Cannot send to BLE - not connected'; }
 proxy_looping(){ "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -q 'Timed out waiting for connection completion'; }
-drop_count()   { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT'; }
-uplink_count() { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic='; }
+# "Node->MQTT: Topic=" is logged for EVERY packet the proxy considers, INCLUDING
+# ones it then drops - so it counts attempts, not successes. Actual uplinks are
+# attempts minus drops.
+#
+# And drops are not automatically a fault. Meshtastic sends key-exchange traffic
+# on a PKI channel that is not configured on the node; dropping an unknown
+# channel is correct loop prevention. The outage signature is not "some drops",
+# it is "everything dropped" - attempts > 0 with zero surviving.
+drop_count()    { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT'; }
+attempt_count() { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic='; }
 
 radio_age() {  # echoes seconds since the last radio packet, or empty if unknown
   "$CTR" logs --tail 400 mqtt-proxy 2>&1 \
@@ -108,15 +116,19 @@ radio_age() {  # echoes seconds since the last radio packet, or empty if unknown
 # ── repair ───────────────────────────────────────────────────────────────────
 settle_and_report() {
   local up dr i
+  local at
   for i in $(seq 1 24); do
     dr=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT')
-    up=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
-    { [ "$dr" -gt 0 ] || [ "$up" -gt 0 ]; } && break
+    at=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
+    up=$(( at - dr )); [ "$up" -lt 0 ] && up=0
+    [ "$at" -gt 0 ] && break
     sleep 5
   done
-  if [ "${dr:-0}" -gt 0 ]; then log "FAILED: still dropping after repair (uplinked=$up dropped=$dr)"; return 1; fi
-  if [ "${up:-0}" -eq 0 ]; then log "INCONCLUSIVE: no drops and no uplink in 120s - the mesh may be quiet, or the node is off"; return 0; fi
-  log "repaired: uplinked=$up dropped=$dr"; return 0
+  if [ "${at:-0}" -gt 0 ] && [ "${up:-0}" -eq 0 ]; then
+    log "FAILED: all ${at} packets still dropped after repair"; return 1; fi
+  if [ "${at:-0}" -eq 0 ]; then
+    log "INCONCLUSIVE: no packets at all in 120s - the mesh may be quiet, or the node is off"; return 0; fi
+  log "repaired: uplinked=$up dropped=$dr of $at attempts"; return 0
 }
 
 repair_bridge() {
@@ -150,15 +162,16 @@ repair_proxy() {
 main() {
   [ -n "$HC" ] || log "note: HC_PING_URL unset in $ENV_FILE - repairs are log-only, nothing will page you"
 
-  local drops uplinks age reason="" mode=""
-  drops=$(drop_count); uplinks=$(uplink_count); age=$(radio_age)
+  local drops attempts uplinks age reason="" mode=""
+  drops=$(drop_count); attempts=$(attempt_count); age=$(radio_age)
+  uplinks=$(( attempts - drops )); [ "$uplinks" -lt 0 ] && uplinks=0
 
   if bridge_gave_up; then
     reason="ble-bridge gave up reconnecting and is alive with no radio"; mode=bridge
   elif ble_down; then
     reason="ble-bridge reports 'Cannot send to BLE - not connected'";     mode=bridge
-  elif [ "$drops" -gt 0 ]; then
-    reason="$drops packets dropped in $WINDOW (empty channel table)";     mode=proxy
+  elif [ "$attempts" -gt 0 ] && [ "$uplinks" -eq 0 ]; then
+    reason="all $attempts packets dropped in $WINDOW (empty channel table)"; mode=proxy
   elif proxy_looping; then
     reason="mqtt-proxy stuck in a connect/timeout loop";                  mode=proxy
   elif [ -n "$age" ] && [ "$age" -gt "$RADIO_MAX" ]; then
@@ -166,7 +179,7 @@ main() {
   fi
 
   if [ -z "$mode" ]; then
-    log "ok: uplinked=$uplinks dropped=$drops radio_age=${age:-unknown}s"
+    log "ok: uplinked=$uplinks dropped=$drops (of $attempts attempts) radio_age=${age:-unknown}s"
     hc
     return 0
   fi

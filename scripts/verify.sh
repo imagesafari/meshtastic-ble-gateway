@@ -56,11 +56,18 @@ echo "== MQTT uplink actually passing traffic"
 # unambiguous failure signal is a drop line: a packet DID arrive from the radio
 # and was thrown away because the proxy's channel table is empty. A quiet mesh
 # produces neither line, so this cannot false-positive on low traffic.
+# "Node->MQTT: Topic=" is logged for every packet considered, INCLUDING ones
+# then dropped, so it counts attempts. Real uplinks are attempts minus drops.
+# Some drops are correct: Meshtastic sends key-exchange traffic on a PKI channel
+# that is not configured on the node, and dropping an unknown channel is proper
+# loop prevention. The outage signature is everything dropped, not some.
 drops=$(ssh -o BatchMode=yes "$TARGET" 'podman logs --since 15m mqtt-proxy 2>&1 | grep -c "Dropping Node->MQTT"' || true)
-[ "${drops:-0}" -eq 0 ] \
-  || fail "mqtt-proxy dropped $drops packets in the last 15m - empty channel table. Run host/mesh-uplink-watchdog.sh"
-ups=$(ssh -o BatchMode=yes "$TARGET" 'podman logs --since 15m mqtt-proxy 2>&1 | grep -c "Node->MQTT: Topic="' || true)
-echo "  no dropped packets in the last 15m (uplinked: ${ups:-0})"
+att=$(ssh -o BatchMode=yes "$TARGET" 'podman logs --since 15m mqtt-proxy 2>&1 | grep -c "Node->MQTT: Topic="' || true)
+ups=$(( ${att:-0} - ${drops:-0} )); [ "$ups" -lt 0 ] && ups=0
+if [ "${att:-0}" -gt 0 ] && [ "$ups" -eq 0 ]; then
+  fail "all ${att} packets dropped in the last 15m - empty channel table. Run host/mesh-uplink-watchdog.sh"
+fi
+echo "  uplinked ${ups} of ${att:-0} attempts in the last 15m (${drops:-0} dropped, unknown channels are normal)"
 
 echo "== uplink watchdog installed"
 ssh -o BatchMode=yes "$TARGET" 'systemctl is-enabled mesh-uplink-watchdog.timer' >/dev/null \
