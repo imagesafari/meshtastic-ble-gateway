@@ -65,6 +65,9 @@ heard-via topology and per-node signal history](docs/img/web-client-connected.pn
 - A USB Bluetooth adapter is worth it. If the host has more than one radio,
   disable the ones you don't want (see `host/81-disable-internal-bt.rules`).
 - An MQTT broker, if you want the gateway half. The browser half works without one.
+- `expect` on the host, for the one-time pairing script.
+- The `meshtastic` CLI, to configure the node. Install it wherever is convenient
+  — it talks to the node over the bridge, so it does not have to be the host.
 
 **Battery cost of a permanent BLE link: about 1%.** The LoRa radio's always-on
 receive dominates at 5–12 mA; BLE adds 0.02–0.5 mA. A solar node does not notice.
@@ -83,9 +86,18 @@ expect host/pair-node.exp
 # 2. Configure
 cp .env.example .env         # set NODE_BLE_MAC at minimum
 
-# 3. Run
-docker compose up -d
-docker compose logs -f ble-bridge
+# 3. Run. ORDER MATTERS — see "ordering matters" below. mqtt-proxy needs ~40s
+#    alone with the bridge to pull the node config, and the bridge broadcasts
+#    that stream to every client, so start the shim only once it has finished.
+docker compose up -d ble-bridge mqtt-proxy
+docker compose logs -f mqtt-proxy      # wait for "Node config fully loaded", then Ctrl-C
+docker compose up -d                   # now everything else
+
+# 4. Check it actually works
+docker compose logs --since 5m mqtt-proxy | grep "Node->MQTT"
+#    Lines with no "Dropping" after them are real uplinks. If EVERY line is
+#    followed by a drop, the proxy came up with an empty channel table — redo
+#    step 3, giving it the bridge to itself.
 ```
 
 Then point a client at it:
@@ -118,8 +130,20 @@ meshtastic --host <your-host> --set mqtt.password <pass>
 meshtastic --host <your-host> --ch-index 0 --ch-set uplink_enabled true
 ```
 
-Restart `mqtt-proxy` after changing node config — it caches what it read when it
-attached.
+**The CLI is a TCP client and costs one of your two slots** while it is
+connected — see the next section. Run it, let it exit, then carry on; do not
+leave it attached.
+
+Restart `mqtt-proxy` after changing node config — it caches what it read when
+it attached. Restart it *with the bridge to itself*, or it can come back with an
+empty channel table and silently drop everything:
+
+```bash
+docker compose stop mesh-api
+docker compose restart mqtt-proxy
+docker compose logs -f mqtt-proxy       # wait for "Node config fully loaded"
+docker compose start mesh-api
+```
 
 ## How many clients can attach — read this one
 
@@ -254,6 +278,19 @@ The first four only appear when something *did* happen and went wrong, so a
 quiet mesh cannot trigger them. The last is the positive-liveness check. Note
 the drop row is *all* dropped, not any: a few dropped `PKI` packets are normal
 and must not trigger a repair.
+
+**On Compose, nothing schedules the watchdog for you.** The `.service` and
+`.timer` files are systemd units used by the quadlet deployment; under Compose,
+run the script yourself from cron or a timer of your own:
+
+```
+*/10 * * * * RESTART_MODE=compose CTR=docker COMPOSE_DIR=/path/to/repo \
+             ENV_FILE=/path/to/repo/watchdog.env \
+             /path/to/repo/host/mesh-uplink-watchdog.sh
+```
+
+The `ExecStartPre` ordering gate is quadlet-only too; under Compose the
+equivalent is the two-step start in Quick start.
 
 Set `HC_PING_URL` in `/etc/mesh-gateway/watchdog.env` (chmod 600, see
 `config/watchdog.env.example`), or the watchdog repairs quietly and nothing

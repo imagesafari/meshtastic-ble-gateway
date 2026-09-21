@@ -108,7 +108,12 @@ services:
       PORT: "3001"
       TRUST_PROXY: "true"
       COOKIE_SECURE: "true"
-      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env}"
+      # NOT ${SESSION_SECRET:?...}: Compose interpolates every service whether or
+      # not its profile is active, so a required-variable guard here breaks a
+      # plain `docker compose up -d` for everyone who never enables this. Set it
+      # in .env before using --profile with-meshmonitor; MeshMonitor will not
+      # start with it empty.
+      SESSION_SECRET: "${SESSION_SECRET:-}"
       ALLOWED_ORIGINS: "${MESHMONITOR_ORIGINS:-}"
     volumes:
       - meshmonitor-data:/data
