@@ -186,16 +186,44 @@ Two log lines actively mislead while it is happening:
 - `MQTT Activity: Ns ago` counts **inbound** broker traffic. It keeps ticking
   over happily while nothing whatsoever is being published.
 
-Three guards ship for this:
+## The third way it dies: the bridge gives up and stays running
+
+Power-cycle the node for a couple of minutes and the bridge retries **10 times
+at 60s intervals**, logs `Failed to reconnect to BLE device after all attempts`,
+exits its polling loop — and keeps running. Container up, unit `active`, TCP
+still accepting clients, BLE gone permanently. `Restart=always` cannot help,
+because the process never exits. That cost three hours here before anyone
+looked.
+
+The first version of the watchdog keyed only on `Dropping Node->MQTT` and was
+structurally blind to it: an unconnected proxy drops nothing, so it reported
+`ok ... (uplinked=0)` repeatedly while the gateway was dead. **Absence of
+badness is not liveness.**
+
+## What guards all of this
 
 | Guard | What it does |
 |---|---|
 | `host/wait-for-mqtt-proxy-config.sh` | `ExecStartPre` on `mesh-api`. `After=` alone is not enough — a quadlet unit is active the moment its container launches, while the proxy still needs ~40s. This is what keeps the shim off the bridge during the dump. Never fails closed: a dead proxy must not also cost you the UI. |
-| `host/mesh-uplink-watchdog.{sh,service,timer}` | Checks every 10 min. Keys on `Dropping Node->MQTT`, which means a packet arrived and was thrown away — so it cannot false-positive on a quiet mesh. Repairs by the ordered restart, and pings healthchecks.io. Works under Compose too: `RESTART_MODE=compose CTR=docker COMPOSE_DIR=$PWD`. |
+| `host/mesh-uplink-watchdog.{sh,service,timer}` | Checks every 10 min on four signals (below) and routes to the matching repair. Works under Compose too: `RESTART_MODE=compose CTR=docker COMPOSE_DIR=$PWD`. |
 | `scripts/verify.sh` | Asserts no drops in the last 15 min, rather than only that the broker is reachable. |
 
-Set `HC_PING_URL` in `/etc/mesh-gateway/watchdog.env` (chmod 600), or the
-watchdog repairs quietly and nothing tells you it happened.
+| Signal | Meaning | Repair |
+|---|---|---|
+| `Failed to reconnect to BLE device after all attempts` newer than the last `Connected to BLE device` | bridge gave up, alive with no radio | recreate the container — a plain restart reuses dead BLE session state — then ordered restart |
+| `Cannot send to BLE - not connected` | same, caught sooner | as above |
+| `Dropping Node->MQTT` | empty channel table; a packet arrived and was discarded | ordered proxy restart |
+| `Timed out waiting for connection completion` | proxy stuck in a connect loop | ordered proxy restart |
+| `Radio Activity: Ns ago` beyond `RADIO_MAX` (default 1h) | nothing arriving at all | recreate the bridge |
+
+The first four only appear when something *did* happen and went wrong, so a
+quiet mesh cannot trigger them. The last is the positive-liveness check.
+
+Set `HC_PING_URL` in `/etc/mesh-gateway/watchdog.env` (chmod 600, see
+`config/watchdog.env.example`), or the watchdog repairs quietly and nothing
+tells you it happened. It appends `/start` before a repair and `/fail` if the
+repair does not take. Hosted and self-hosted healthchecks use different ping
+paths; the example file shows both.
 
 **Manual recovery**, if you need it: stop `mesh-api` *and* `mqtt-proxy`, start
 `mqtt-proxy` alone, wait for `Node config fully loaded` followed by a

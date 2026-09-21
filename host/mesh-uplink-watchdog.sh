@@ -1,41 +1,42 @@
 #!/usr/bin/env bash
-# Detect and repair an mqtt-proxy that is "up" but uplinking nothing.
+# Detect and repair a Meshtastic gateway that is "up" but passing no traffic.
 #
 # WHY THIS EXISTS
 # ---------------
-# Every liveness signal this stack has can be green while the gateway is dead.
-# It happened here for 79 hours: all five services running, BLE connected, radio
-# packets arriving every few seconds, broker connected, "MQTT Connected: True"
-# in every status block, and scripts/verify.sh passing throughout.
+# Every liveness signal this stack has can be green while the gateway is dead,
+# and it has now happened twice for different reasons:
 #
-# mqtt-proxy decides per packet whether a channel may uplink by looking the
-# topic's channel name up in the node config it loaded at startup. The BLE
-# bridge broadcasts the node's stream to EVERY TCP client, so another client's
-# configComplete can arrive while mqtt-proxy's own dump is still in flight. The
-# proxy marks a half-finished config as loaded, ends up with an empty channel
-# table, and then drops every outbound packet "to prevent loops" - which is the
-# correct default for a genuinely unknown channel, and catastrophic when the
-# reason it is unknown is that the config never arrived.
+#  2026-09-17, 79 hours. The BLE bridge broadcasts the node's stream to EVERY
+#  TCP client, so mesh-api's configComplete landed while mqtt-proxy's own dump
+#  was still in flight. The proxy marked a half-finished config as loaded, ran
+#  with an empty channel table, and dropped every outbound packet "to prevent
+#  loops". Units active, broker connected, radio busy, verify.sh passing.
 #
-# The tell is unambiguous and has no quiet-mesh false positive: a "Dropping
-# Node->MQTT" line means a packet DID arrive and was thrown away. A quiet mesh
-# produces neither that line nor an uplink line.
+#  2026-09-21, 3 hours. The node was power-cycled. The bridge retried 10 times
+#  over ~10 minutes, logged "Failed to reconnect to BLE device after all
+#  attempts", exited its polling loop - and KEPT RUNNING. Container up, unit
+#  active, TCP still accepting clients, BLE gone permanently. Restart=always
+#  cannot help because the process never exits.
 #
-# Two log messages actively mislead while this is happening:
-#   * "uplink_enabled=False for channel 'LongFast'" sounds like the node has
-#     uplink disabled. It does not. It means "no channel by that name, so I
-#     assumed false". Check the node itself with `meshtastic --info`.
-#   * "MQTT Activity: Ns ago" counts INBOUND broker traffic, so it keeps
-#     ticking over while nothing at all is being published.
+# The first version of this script keyed only on "Dropping Node->MQTT" and was
+# structurally blind to the second failure: an unconnected proxy drops nothing,
+# so it logged "ok ... (uplinked=0)" three times while the gateway was dead.
+# Absence of badness is not liveness. This version checks four signals.
+#
+# MISLEADING LOG LINES, for whoever reads this next:
+#   "uplink_enabled=False for channel 'LongFast'" does NOT mean the node has
+#   uplink disabled. It means "no channel by that name, so I assumed false" -
+#   the channel table is empty. Check the node with `meshtastic --info`.
+#   "MQTT Activity: Ns ago" counts INBOUND broker traffic. It keeps ticking
+#   over happily while nothing whatsoever is being published.
 #
 # USAGE
-#   Quadlet/systemd (default):  install with scripts/deploy.sh, runs on a timer.
-#   Docker Compose:             RESTART_MODE=compose COMPOSE_DIR=/path/to/repo \
-#                               CTR=docker  mesh-uplink-watchdog.sh
-#                               (drive it from cron or a systemd timer of your own)
+#   systemd/quadlet (default): installed by scripts/deploy.sh, runs on a timer.
+#   docker compose:            RESTART_MODE=compose CTR=docker COMPOSE_DIR=$PWD
 set -uo pipefail
 
 WINDOW="${WINDOW:-15m}"
+RADIO_MAX="${RADIO_MAX:-3600}"           # seconds; radio quiet longer than this is suspect
 CTR="${CTR:-podman}"                     # podman | docker
 RESTART_MODE="${RESTART_MODE:-systemd}"  # systemd | compose
 COMPOSE_DIR="${COMPOSE_DIR:-/opt/mesh-gateway}"
@@ -46,87 +47,139 @@ HC="${HC_PING_URL:-}"
 
 log() { printf '%s [mesh-watchdog] %s\n' "$(date -Is)" "$*"; }
 
-hc() {  # never let an alerting failure mask the real result
+hc() {  # an alerting failure must never mask the real result
   [ -n "$HC" ] || return 0
   curl -fsS -m 10 --retry 3 "${HC}${1:-}" >/dev/null || log "WARN: healthchecks ping '${1:-/ok}' failed"
 }
 
-logs() { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1; }
-
-svc_stop()  { case "$RESTART_MODE" in
-                systemd) systemctl stop "$1" ;;
-                compose) ( cd "$COMPOSE_DIR" && "$CTR" compose stop "$1" ) ;;
-              esac }
-svc_start() { case "$RESTART_MODE" in
-                systemd) systemctl start "$1" ;;
-                compose) ( cd "$COMPOSE_DIR" && "$CTR" compose start "$1" ) ;;
-              esac }
-svc_restart() { case "$RESTART_MODE" in
-                systemd) systemctl restart "$1" ;;
-                compose) ( cd "$COMPOSE_DIR" && "$CTR" compose restart "$1" ) ;;
-              esac }
-
-# The ordered restart: mqtt-proxy must take its config dump with no other TCP
-# client attached, or it can inherit a foreign configComplete all over again.
-repair() {
-  log "repairing: stopping mesh-api so mqtt-proxy gets an uncontended dump"
-  svc_stop mesh-api
-
-  log "restarting mqtt-proxy"
-  svc_restart mqtt-proxy
-
-  local i loaded=""
-  for i in $(seq 1 40); do          # 40 * 5s = 200s; a clean dump measured 38.8s
-    if "$CTR" logs mqtt-proxy 2>&1 | grep -q 'Node config fully loaded'; then loaded=1; break; fi
-    sleep 5
-  done
-  [ -n "$loaded" ] || log "WARN: mqtt-proxy never logged 'Node config fully loaded' within 200s"
-
-  local up=0 dr=0
-  for i in $(seq 1 24); do          # up to 120s to see real traffic either way
-    up=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
-    dr=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT')
-    [ "$dr" -gt 0 ] && break
-    [ "$up" -gt 0 ] && break
-    sleep 5
-  done
-
-  log "restarting mesh-api"
-  svc_start mesh-api
-
-  if [ "$dr" -gt 0 ]; then
-    log "FAILED: still dropping after repair (uplinked=$up dropped=$dr)"
-    return 1
-  fi
-  if [ "$up" -eq 0 ]; then
-    log "INCONCLUSIVE: no drops, but no uplink seen in 120s either (the mesh may simply be quiet)"
-    return 0
-  fi
-  log "repaired: uplinked=$up dropped=$dr"
-  return 0
+svc() {  # svc <start|stop|restart> <unit>
+  case "$RESTART_MODE" in
+    systemd) systemctl "$1" "$2" ;;
+    compose) ( cd "$COMPOSE_DIR" && "$CTR" compose "$1" "$2" ) ;;
+  esac
 }
 
+recreate_bridge() {
+  # A plain restart reuses dead BLE session state; the container must be removed.
+  case "$RESTART_MODE" in
+    systemd) systemctl stop ble-bridge; sleep 2; "$CTR" rm -f ble-bridge >/dev/null 2>&1
+             systemctl start ble-bridge ;;
+    compose) ( cd "$COMPOSE_DIR" && "$CTR" compose rm -sf ble-bridge >/dev/null 2>&1
+               "$CTR" compose up -d ble-bridge ) ;;
+  esac
+}
+
+wait_for() {  # wait_for <container> <pattern> <max-seconds>
+  local waited=0
+  while [ "$waited" -lt "$3" ]; do
+    "$CTR" logs "$1" 2>&1 | grep -aq "$2" && return 0
+    sleep 5; waited=$((waited + 5))
+  done
+  return 1
+}
+
+# ── detection ────────────────────────────────────────────────────────────────
+# A "Dropping Node->MQTT" line means a packet ARRIVED and was thrown away, so it
+# cannot false-positive on a quiet mesh. The bridge give-up line is likewise
+# unambiguous. Radio staleness is the positive-liveness check that the first
+# version lacked.
+
+bridge_gave_up() {
+  # give-up must be more recent than the last successful connect; line numbers
+  # order an append-only log without parsing timestamps.
+  local ok dead
+  ok=$("$CTR"  logs ble-bridge 2>&1 | grep -an 'Connected to BLE device' | tail -1 | cut -d: -f1)
+  dead=$("$CTR" logs ble-bridge 2>&1 | grep -anE 'Failed to reconnect to BLE device after all attempts|exiting polling loop' | tail -1 | cut -d: -f1)
+  [ -n "$dead" ] || return 1
+  [ -n "$ok" ]   || return 0
+  [ "$dead" -gt "$ok" ]
+}
+
+ble_down()     { "$CTR" logs --since "$WINDOW" ble-bridge 2>&1 | grep -q 'Cannot send to BLE - not connected'; }
+proxy_looping(){ "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -q 'Timed out waiting for connection completion'; }
+drop_count()   { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT'; }
+uplink_count() { "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic='; }
+
+radio_age() {  # echoes seconds since the last radio packet, or empty if unknown
+  "$CTR" logs --tail 400 mqtt-proxy 2>&1 \
+    | sed -n 's/.*Radio Activity:[[:space:]]*\([0-9][0-9]*\)s ago.*/\1/p' | tail -1
+}
+
+# ── repair ───────────────────────────────────────────────────────────────────
+settle_and_report() {
+  local up dr i
+  for i in $(seq 1 24); do
+    dr=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT')
+    up=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
+    { [ "$dr" -gt 0 ] || [ "$up" -gt 0 ]; } && break
+    sleep 5
+  done
+  if [ "${dr:-0}" -gt 0 ]; then log "FAILED: still dropping after repair (uplinked=$up dropped=$dr)"; return 1; fi
+  if [ "${up:-0}" -eq 0 ]; then log "INCONCLUSIVE: no drops and no uplink in 120s - the mesh may be quiet, or the node is off"; return 0; fi
+  log "repaired: uplinked=$up dropped=$dr"; return 0
+}
+
+repair_bridge() {
+  log "repair(bridge): stopping clients, recreating ble-bridge"
+  svc stop mesh-api; svc stop mqtt-proxy
+  recreate_bridge
+  if wait_for ble-bridge 'Connected to BLE device' 200; then
+    log "  BLE reconnected"
+  else
+    log "  WARN: no BLE connection within 200s - the node itself may be off, or the adapter is wedged"
+  fi
+  svc start mqtt-proxy
+  wait_for mqtt-proxy 'Node config fully loaded' 200 \
+    && log "  proxy config loaded" || log "  WARN: proxy did not load config within 200s"
+  svc start mesh-api
+  settle_and_report
+}
+
+repair_proxy() {
+  # mqtt-proxy must take its config dump with no other TCP client attached.
+  log "repair(proxy): stopping mesh-api so mqtt-proxy gets an uncontended dump"
+  svc stop mesh-api
+  svc restart mqtt-proxy
+  wait_for mqtt-proxy 'Node config fully loaded' 200 \
+    && log "  proxy config loaded" || log "  WARN: proxy did not load config within 200s"
+  svc start mesh-api
+  settle_and_report
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
 main() {
   [ -n "$HC" ] || log "note: HC_PING_URL unset in $ENV_FILE - repairs are log-only, nothing will page you"
 
-  local drops uplinks
-  drops=$(logs | grep -c 'Dropping Node->MQTT')
-  uplinks=$(logs | grep -c 'Node->MQTT: Topic=')
+  local drops uplinks age reason="" mode=""
+  drops=$(drop_count); uplinks=$(uplink_count); age=$(radio_age)
 
-  if [ "$drops" -eq 0 ]; then
-    log "ok: no dropped packets in the last $WINDOW (uplinked=$uplinks)"
+  if bridge_gave_up; then
+    reason="ble-bridge gave up reconnecting and is alive with no radio"; mode=bridge
+  elif ble_down; then
+    reason="ble-bridge reports 'Cannot send to BLE - not connected'";     mode=bridge
+  elif [ "$drops" -gt 0 ]; then
+    reason="$drops packets dropped in $WINDOW (empty channel table)";     mode=proxy
+  elif proxy_looping; then
+    reason="mqtt-proxy stuck in a connect/timeout loop";                  mode=proxy
+  elif [ -n "$age" ] && [ "$age" -gt "$RADIO_MAX" ]; then
+    reason="no radio packet for ${age}s (limit ${RADIO_MAX}s)";           mode=bridge
+  fi
+
+  if [ -z "$mode" ]; then
+    log "ok: uplinked=$uplinks dropped=$drops radio_age=${age:-unknown}s"
     hc
     return 0
   fi
 
-  log "BROKEN: $drops packets dropped in the last $WINDOW (uplinked=$uplinks)"
+  log "BROKEN: $reason (uplinked=$uplinks dropped=$drops radio_age=${age:-unknown}s)"
   hc /start
-  if repair; then hc; return 0; fi
-  hc /fail
-  return 1
+  if [ "$mode" = bridge ]; then repair_bridge; else repair_proxy; fi
+  local rc=$?
+  [ "$rc" -eq 0 ] && hc || hc /fail
+  return "$rc"
 }
 
-# One watchdog at a time. -n so a stuck repair does not queue runs behind itself.
-exec 9>/run/mesh-uplink-watchdog.lock
+# One watchdog at a time. -n so a slow repair does not queue runs behind itself.
+exec 9>"${LOCK_FILE:-/run/mesh-uplink-watchdog.lock}"
 flock -n 9 || { log "another watchdog run holds the lock, skipping"; exit 0; }
 main "$@"
