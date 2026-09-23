@@ -279,6 +279,15 @@ quiet mesh cannot trigger them. The last is the positive-liveness check. Note
 the drop row is *all* dropped, not any: a few dropped `PKI` packets are normal
 and must not trigger a repair.
 
+**Stopping a unit on purpose makes the watchdog stand down.** Pairing, a
+firmware flash or a serial config session all need the bridge off the node's
+single BLE slot. When `ble-bridge` or `mqtt-proxy` has been stopped (or, under
+Compose, removed), the watchdog logs `standing down` and neither repairs it nor
+pings. The healthcheck therefore goes down after its grace period — expected
+during maintenance; pause the check if that is noise. A unit that crashed is
+still repaired: with `Restart=always` a crashed unit never stays down, except
+at systemd's start limit, which is treated as a fault.
+
 **On Compose, nothing schedules the watchdog for you.** The `.service` and
 `.timer` files are systemd units used by the quadlet deployment; under Compose,
 run the script yourself from cron or a timer of your own:
@@ -288,6 +297,10 @@ run the script yourself from cron or a timer of your own:
              ENV_FILE=/path/to/repo/watchdog.env \
              /path/to/repo/host/mesh-uplink-watchdog.sh
 ```
+
+Run as a non-root user, the watchdog keeps its lock in `$XDG_RUNTIME_DIR` (or
+`/tmp`); set `LOCK_FILE` to choose another path. If the lock cannot be opened
+it fails loudly and pings `/fail` rather than skipping the run.
 
 The `ExecStartPre` ordering gate is quadlet-only too; under Compose the
 equivalent is the two-step start in Quick start.

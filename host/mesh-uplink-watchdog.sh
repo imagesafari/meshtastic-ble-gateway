@@ -69,13 +69,79 @@ recreate_bridge() {
   esac
 }
 
-wait_for() {  # wait_for <container> <pattern> <max-seconds>
+# log_has <container> <pattern> [extra `logs` args...]
+# Never `"$CTR" logs ... | grep -q`: grep -q exits on the first match while the
+# container runtime is still writing, the writer takes SIGPIPE, and under
+# pipefail the pipeline returns 141 - a MISSED match for a line that is there.
+# For the fault checks below that means a broken gateway reported as healthy.
+# Capture first, then grep the variable. A failure to read logs returns 2, says
+# so on stderr, and sets LOG_READ_FAILED - main() refuses to report "ok" when it
+# is set, so an unreadable log can never pass for "pattern absent".
+LOG_READ_FAILED=""
+log_has() {
+  local c=$1 pat=$2 out; shift 2
+  if ! out=$("$CTR" logs "$@" "$c" 2>&1); then
+    echo "[mesh-watchdog] WARN: $CTR logs $c failed: ${out:0:200}" >&2
+    LOG_READ_FAILED=$c
+    return 2
+  fi
+  grep -aq -- "$pat" <<<"$out"
+}
+
+wait_for() {  # wait_for <container> <pattern> <max-seconds> [since]
+  # Pass `since` after a restart: compose keeps the same container, and its log,
+  # across `restart`, so a line from before the repair would match at once.
   local waited=0
   while [ "$waited" -lt "$3" ]; do
-    "$CTR" logs "$1" 2>&1 | grep -aq "$2" && return 0
+    log_has "$1" "$2" ${4:+--since "$4"} && return 0
     sleep 5; waited=$((waited + 5))
   done
   return 1
+}
+
+# logs_readable <container>
+# Every detector below turns a failed `logs` call into a benign answer: grep -c
+# on an error message is 0, sed on it is empty, bridge_gave_up returns "no".
+# A container that is missing or crash-looping under quadlet's --rm therefore
+# reads as a healthy, quiet gateway. Check readability first and loudly, so that
+# state is reported as a fault instead of "ok".
+logs_readable() {
+  local out
+  out=$("$CTR" logs --tail 1 "$1" 2>&1) && return 0
+  log "cannot read $1 logs: ${out:0:200}"
+  return 1
+}
+
+# unit_stopped <name>
+# True when the operator stopped the unit on purpose - pairing, a firmware flash,
+# a serial config session - which the docs tell them to do. Under quadlet,
+# `systemctl stop` also removes the container, so its logs vanish exactly like a
+# crash; without this check the watchdog "repaired" a stopped bridge straight
+# back onto the node's single BLE slot mid-session.
+#   systemd: every unit here has Restart=always, so a CRASHED unit never stays
+#            down - systemd restarts it and it reads "activating"/"active". A
+#            unit that stays "inactive" OR "failed" was stopped by someone:
+#            these containers exit non-zero on SIGTERM, so a plain
+#            `systemctl stop` leaves them "failed", not "inactive" (measured on
+#            a live gateway, 2026-09-23). The one crash that does stay down is
+#            start-limit-hit, which systemd records in Result=, and that stays a
+#            fault. A unit without Restart=always would be misread as stopped;
+#            that still is not silent - no ping is sent, so the healthcheck
+#            goes down after its grace period.
+#   compose: docker keeps stopped and crashed containers, so an absent one was
+#            removed deliberately (`docker compose down`/`rm`).
+unit_stopped() {
+  case "$RESTART_MODE" in
+    systemd)
+      local state result
+      state=$(systemctl show -p ActiveState --value "$1" 2>&1)
+      result=$(systemctl show -p Result --value "$1" 2>&1)
+      case "$state" in
+        inactive|failed) [ "$result" != start-limit-hit ] ;;
+        *) return 1 ;;
+      esac ;;
+    compose) ! "$CTR" inspect "$1" >/dev/null 2>&1 ;;
+  esac
 }
 
 # ── detection ────────────────────────────────────────────────────────────────
@@ -95,8 +161,8 @@ bridge_gave_up() {
   [ "$dead" -gt "$ok" ]
 }
 
-ble_down()     { "$CTR" logs --since "$WINDOW" ble-bridge 2>&1 | grep -q 'Cannot send to BLE - not connected'; }
-proxy_looping(){ "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -q 'Timed out waiting for connection completion'; }
+ble_down()     { log_has ble-bridge 'Cannot send to BLE - not connected' --since "$WINDOW"; }
+proxy_looping(){ log_has mqtt-proxy 'Timed out waiting for connection completion' --since "$WINDOW"; }
 # "Node->MQTT: Topic=" is logged for EVERY packet the proxy considers, INCLUDING
 # ones it then drops - so it counts attempts, not successes. Actual uplinks are
 # attempts minus drops.
@@ -114,48 +180,65 @@ radio_age() {  # echoes seconds since the last radio packet, or empty if unknown
 }
 
 # ── repair ───────────────────────────────────────────────────────────────────
-settle_and_report() {
+settle_and_report() {  # settle_and_report [since] [config-loaded 0|1]
+  local since=${1:-3m} loaded=${2:-1}
   local up dr i
   local at
+  local out c
+  for c in ble-bridge mqtt-proxy; do
+    logs_readable "$c" || { log "FAILED: $c logs unreadable after repair - it is not running"; return 1; }
+  done
   for i in $(seq 1 24); do
-    dr=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT')
-    at=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
+    # One read per pass, checked: grep -c on podman's error text is 0, which is
+    # indistinguishable from a quiet mesh and used to end in a success ping.
+    if ! out=$("$CTR" logs --since "$since" mqtt-proxy 2>&1); then
+      log "FAILED: cannot read mqtt-proxy logs after repair: ${out:0:200}"; return 1; fi
+    dr=$(grep -c 'Dropping Node->MQTT' <<<"$out")
+    at=$(grep -c 'Node->MQTT: Topic=' <<<"$out")
     up=$(( at - dr )); [ "$up" -lt 0 ] && up=0
     [ "$at" -gt 0 ] && break
     sleep 5
   done
   if [ "${at:-0}" -gt 0 ] && [ "${up:-0}" -eq 0 ]; then
     log "FAILED: all ${at} packets still dropped after repair"; return 1; fi
+  if [ "${at:-0}" -eq 0 ] && [ "$loaded" != 1 ]; then
+    # Nothing uplinked AND the proxy never confirmed its config: that is not a
+    # quiet mesh, it is a proxy that did not come back.
+    log "FAILED: proxy never confirmed its config and nothing has uplinked since the repair"; return 1; fi
   if [ "${at:-0}" -eq 0 ]; then
     log "INCONCLUSIVE: no packets at all in 120s - the mesh may be quiet, or the node is off"; return 0; fi
   log "repaired: uplinked=$up dropped=$dr of $at attempts"; return 0
 }
 
 repair_bridge() {
+  local t0; t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   log "repair(bridge): stopping clients, recreating ble-bridge"
   svc stop mesh-api; svc stop mqtt-proxy
   recreate_bridge
-  if wait_for ble-bridge 'Connected to BLE device' 200; then
+  if wait_for ble-bridge 'Connected to BLE device' 200 "$t0"; then
     log "  BLE reconnected"
   else
     log "  WARN: no BLE connection within 200s - the node itself may be off, or the adapter is wedged"
   fi
   svc start mqtt-proxy
-  wait_for mqtt-proxy 'Node config fully loaded' 200 \
-    && log "  proxy config loaded" || log "  WARN: proxy did not load config within 200s"
+  local loaded=0
+  wait_for mqtt-proxy 'Node config fully loaded' 200 "$t0" \
+    && { loaded=1; log "  proxy config loaded"; } || log "  WARN: proxy did not load config within 200s"
   svc start mesh-api
-  settle_and_report
+  settle_and_report "$t0" "$loaded"
 }
 
 repair_proxy() {
   # mqtt-proxy must take its config dump with no other TCP client attached.
+  local t0; t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   log "repair(proxy): stopping mesh-api so mqtt-proxy gets an uncontended dump"
   svc stop mesh-api
   svc restart mqtt-proxy
-  wait_for mqtt-proxy 'Node config fully loaded' 200 \
-    && log "  proxy config loaded" || log "  WARN: proxy did not load config within 200s"
+  local loaded=0
+  wait_for mqtt-proxy 'Node config fully loaded' 200 "$t0" \
+    && { loaded=1; log "  proxy config loaded"; } || log "  WARN: proxy did not load config within 200s"
   svc start mesh-api
-  settle_and_report
+  settle_and_report "$t0" "$loaded"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -166,7 +249,22 @@ main() {
   drops=$(drop_count); attempts=$(attempt_count); age=$(radio_age)
   uplinks=$(( attempts - drops )); [ "$uplinks" -lt 0 ] && uplinks=0
 
-  if bridge_gave_up; then
+  local u
+  for u in ble-bridge mqtt-proxy; do
+    if unit_stopped "$u"; then
+      # No ping either way: a success ping would hide that the gateway is down,
+      # a /fail would page during maintenance. The healthcheck goes grey-then-
+      # down after its grace period, which is the honest signal.
+      log "standing down: $u is stopped on purpose - not repairing it and not pinging"
+      return 0
+    fi
+  done
+
+  if ! logs_readable ble-bridge; then
+    reason="ble-bridge logs unreadable - container missing, crash-looping, or $CTR broken"; mode=bridge
+  elif ! logs_readable mqtt-proxy; then
+    reason="mqtt-proxy logs unreadable - container missing, crash-looping, or $CTR broken"; mode=proxy
+  elif bridge_gave_up; then
     reason="ble-bridge gave up reconnecting and is alive with no radio"; mode=bridge
   elif ble_down; then
     reason="ble-bridge reports 'Cannot send to BLE - not connected'";     mode=bridge
@@ -176,6 +274,12 @@ main() {
     reason="mqtt-proxy stuck in a connect/timeout loop";                  mode=proxy
   elif [ -n "$age" ] && [ "$age" -gt "$RADIO_MAX" ]; then
     reason="no radio packet for ${age}s (limit ${RADIO_MAX}s)";           mode=bridge
+  fi
+  # A log_has() read failure is returned as 2, which the elif chain above cannot
+  # tell from "pattern absent". Never let that reach the "ok" branch.
+  if [ -z "$mode" ] && [ -n "$LOG_READ_FAILED" ]; then
+    reason="$LOG_READ_FAILED logs became unreadable mid-check"
+    [ "$LOG_READ_FAILED" = ble-bridge ] && mode=bridge || mode=proxy
   fi
 
   if [ -z "$mode" ]; then
@@ -193,6 +297,15 @@ main() {
 }
 
 # One watchdog at a time. -n so a slow repair does not queue runs behind itself.
-exec 9>"${LOCK_FILE:-/run/mesh-uplink-watchdog.lock}"
+# /run is root-only; a user crontab (the compose recipe) needs a writable path.
+if [ "$(id -u)" = 0 ]; then LOCK_DEFAULT=/run; else LOCK_DEFAULT="${XDG_RUNTIME_DIR:-/tmp}"; fi
+LOCK_FILE="${LOCK_FILE:-$LOCK_DEFAULT/mesh-uplink-watchdog.lock}"
+# A lock we cannot open must not share a branch with "another run holds it":
+# that exited 0 having checked nothing, and said something false.
+if ! exec 9>"$LOCK_FILE"; then
+  log "FAILED: cannot open lock file $LOCK_FILE - set LOCK_FILE to a writable path"
+  hc /fail
+  exit 1
+fi
 flock -n 9 || { log "another watchdog run holds the lock, skipping"; exit 0; }
 main "$@"

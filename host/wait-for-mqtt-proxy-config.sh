@@ -21,8 +21,15 @@ CTR="${CTR:-podman}"
 STEP=5
 waited=0
 
+# Read the log into a variable and grep that, never `logs | grep -q`. grep -q
+# exits on its first match while the runtime is still writing; the writer takes
+# SIGPIPE and, under pipefail, the pipeline reports 141 - a FAILED match for a
+# line that is present. stderr is kept too: the proxy logs to stderr, and a
+# runtime error must be seen, not read as "not yet".
 while [ "$waited" -lt "$DEADLINE" ]; do
-  if "$CTR" logs mqtt-proxy 2>/dev/null | grep -q 'Node config fully loaded'; then
+  if ! logs=$("$CTR" logs mqtt-proxy 2>&1); then
+    echo "WARN: $CTR logs mqtt-proxy failed: ${logs:0:200}" >&2
+  elif grep -aq 'Node config fully loaded' <<<"$logs"; then
     echo "mqtt-proxy reported config loaded after ${waited}s; starting mesh-api"
     exit 0
   fi
