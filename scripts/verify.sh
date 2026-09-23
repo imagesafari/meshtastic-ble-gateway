@@ -42,7 +42,9 @@ echo "  4403 accepting"
 echo "== MQTT proxy attached and healthy (status prints every 60s; retrying up to 90s)"
 proxy_ok=""
 for i in 1 2 3 4 5 6 7 8 9; do
-  if ssh -o BatchMode=yes "$TARGET" 'podman logs --tail 40 mqtt-proxy 2>&1' | grep -aq "MQTT Connected: True"; then
+  # Capture, then grep: `ssh ... | grep -q` races ssh into SIGPIPE under pipefail.
+  status=$(ssh -o BatchMode=yes "$TARGET" 'podman logs --tail 40 mqtt-proxy 2>&1') || status=""
+  if grep -aq "MQTT Connected: True" <<<"$status"; then
     proxy_ok=1; break
   fi
   sleep 10

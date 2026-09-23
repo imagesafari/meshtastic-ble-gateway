@@ -69,12 +69,44 @@ recreate_bridge() {
   esac
 }
 
+# log_has <container> <pattern> [extra `logs` args...]
+# Never `"$CTR" logs ... | grep -q`: grep -q exits on the first match while the
+# container runtime is still writing, the writer takes SIGPIPE, and under
+# pipefail the pipeline returns 141 - a MISSED match for a line that is there.
+# For the fault checks below that means a broken gateway reported as healthy.
+# Capture first, then grep the variable. A failure to read logs returns 2, says
+# so on stderr, and sets LOG_READ_FAILED - main() refuses to report "ok" when it
+# is set, so an unreadable log can never pass for "pattern absent".
+LOG_READ_FAILED=""
+log_has() {
+  local c=$1 pat=$2 out; shift 2
+  if ! out=$("$CTR" logs "$@" "$c" 2>&1); then
+    echo "[mesh-watchdog] WARN: $CTR logs $c failed: ${out:0:200}" >&2
+    LOG_READ_FAILED=$c
+    return 2
+  fi
+  grep -aq -- "$pat" <<<"$out"
+}
+
 wait_for() {  # wait_for <container> <pattern> <max-seconds>
   local waited=0
   while [ "$waited" -lt "$3" ]; do
-    "$CTR" logs "$1" 2>&1 | grep -aq "$2" && return 0
+    log_has "$1" "$2" && return 0
     sleep 5; waited=$((waited + 5))
   done
+  return 1
+}
+
+# logs_readable <container>
+# Every detector below turns a failed `logs` call into a benign answer: grep -c
+# on an error message is 0, sed on it is empty, bridge_gave_up returns "no".
+# A container that is missing or crash-looping under quadlet's --rm therefore
+# reads as a healthy, quiet gateway. Check readability first and loudly, so that
+# state is reported as a fault instead of "ok".
+logs_readable() {
+  local out
+  out=$("$CTR" logs --tail 1 "$1" 2>&1) && return 0
+  log "cannot read $1 logs: ${out:0:200}"
   return 1
 }
 
@@ -95,8 +127,8 @@ bridge_gave_up() {
   [ "$dead" -gt "$ok" ]
 }
 
-ble_down()     { "$CTR" logs --since "$WINDOW" ble-bridge 2>&1 | grep -q 'Cannot send to BLE - not connected'; }
-proxy_looping(){ "$CTR" logs --since "$WINDOW" mqtt-proxy 2>&1 | grep -q 'Timed out waiting for connection completion'; }
+ble_down()     { log_has ble-bridge 'Cannot send to BLE - not connected' --since "$WINDOW"; }
+proxy_looping(){ log_has mqtt-proxy 'Timed out waiting for connection completion' --since "$WINDOW"; }
 # "Node->MQTT: Topic=" is logged for EVERY packet the proxy considers, INCLUDING
 # ones it then drops - so it counts attempts, not successes. Actual uplinks are
 # attempts minus drops.
@@ -117,9 +149,17 @@ radio_age() {  # echoes seconds since the last radio packet, or empty if unknown
 settle_and_report() {
   local up dr i
   local at
+  local out c
+  for c in ble-bridge mqtt-proxy; do
+    logs_readable "$c" || { log "FAILED: $c logs unreadable after repair - it is not running"; return 1; }
+  done
   for i in $(seq 1 24); do
-    dr=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Dropping Node->MQTT')
-    at=$("$CTR" logs --since 3m mqtt-proxy 2>&1 | grep -c 'Node->MQTT: Topic=')
+    # One read per pass, checked: grep -c on podman's error text is 0, which is
+    # indistinguishable from a quiet mesh and used to end in a success ping.
+    if ! out=$("$CTR" logs --since 3m mqtt-proxy 2>&1); then
+      log "FAILED: cannot read mqtt-proxy logs after repair: ${out:0:200}"; return 1; fi
+    dr=$(grep -c 'Dropping Node->MQTT' <<<"$out")
+    at=$(grep -c 'Node->MQTT: Topic=' <<<"$out")
     up=$(( at - dr )); [ "$up" -lt 0 ] && up=0
     [ "$at" -gt 0 ] && break
     sleep 5
@@ -166,7 +206,11 @@ main() {
   drops=$(drop_count); attempts=$(attempt_count); age=$(radio_age)
   uplinks=$(( attempts - drops )); [ "$uplinks" -lt 0 ] && uplinks=0
 
-  if bridge_gave_up; then
+  if ! logs_readable ble-bridge; then
+    reason="ble-bridge logs unreadable - container missing, crash-looping, or $CTR broken"; mode=bridge
+  elif ! logs_readable mqtt-proxy; then
+    reason="mqtt-proxy logs unreadable - container missing, crash-looping, or $CTR broken"; mode=proxy
+  elif bridge_gave_up; then
     reason="ble-bridge gave up reconnecting and is alive with no radio"; mode=bridge
   elif ble_down; then
     reason="ble-bridge reports 'Cannot send to BLE - not connected'";     mode=bridge
@@ -176,6 +220,12 @@ main() {
     reason="mqtt-proxy stuck in a connect/timeout loop";                  mode=proxy
   elif [ -n "$age" ] && [ "$age" -gt "$RADIO_MAX" ]; then
     reason="no radio packet for ${age}s (limit ${RADIO_MAX}s)";           mode=bridge
+  fi
+  # A log_has() read failure is returned as 2, which the elif chain above cannot
+  # tell from "pattern absent". Never let that reach the "ok" branch.
+  if [ -z "$mode" ] && [ -n "$LOG_READ_FAILED" ]; then
+    reason="$LOG_READ_FAILED logs became unreadable mid-check"
+    [ "$LOG_READ_FAILED" = ble-bridge ] && mode=bridge || mode=proxy
   fi
 
   if [ -z "$mode" ]; then

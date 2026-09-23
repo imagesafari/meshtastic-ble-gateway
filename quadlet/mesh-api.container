@@ -27,6 +27,9 @@ Exec=python /app/http_api_shim.py
 # container launches, while mqtt-proxy still needs ~40s to pull the node config.
 # This gate is what actually keeps this shim off the bridge during that window.
 ExecStartPre=/usr/local/bin/wait-for-mqtt-proxy-config.sh
+# The gate waits up to 240s and then starts the shim anyway. systemd's default
+# 90s start timeout would kill it first, so that fallback could never run.
+TimeoutStartSec=300
 Restart=always
 RestartSec=5
 
